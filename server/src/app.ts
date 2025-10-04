@@ -40,12 +40,12 @@ app.use('/api/content-items', contentItemsRoutes);
 app.use('/api/client-tokens', clientTokensRoutes);
 
 // 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ 
-    error: 'Route not found',
-    path: req.originalUrl 
-  });
-});
+// app.use('*', (req, res) => {
+//   res.status(404).json({ 
+//     error: 'Route not found',
+//     path: req.originalUrl 
+//   });
+// });
 
 // Global error handler
 app.use((error: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

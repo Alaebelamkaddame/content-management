@@ -6,8 +6,7 @@ export interface AuthRequest extends Request {
 }
 
 export const authenticateToken = (req: AuthRequest, res: Response, next: NextFunction) => {
-  // For now, this is a placeholder
-  // You'll implement proper JWT authentication later
+  //later
   next();
 };
 

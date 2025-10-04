@@ -141,16 +141,16 @@ export class ContentItemsService {
 
   async deleteContentItem(id: string): Promise<boolean> {
     const result = await pool.query('DELETE FROM content_items WHERE id = $1', [id]);
-    return result.rowCount > 0;
+    return (result.rowCount ?? 0) > 0;
   }
 
   async getContentItemsByDateRange(startDate: Date, endDate: Date, projectId?: string): Promise<ContentItem[]> {
     let query = 'SELECT * FROM content_items WHERE start_date >= $1 AND start_date <= $2';
-    const values = [startDate, endDate];
+    const values: (Date | string)[] = [startDate, endDate];
 
     if (projectId) {
       query += ' AND project_id = $3';
-      values.push(projectId);
+      values.push(projectId as string);
     }
 
     query += ' ORDER BY start_date ASC';

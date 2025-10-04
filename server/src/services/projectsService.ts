@@ -64,7 +64,7 @@ export class ProjectsService {
 
   async deleteProject(id: string): Promise<boolean> {
     const result = await pool.query('DELETE FROM projects WHERE id = $1', [id]);
-    return result.rowCount > 0;
+    return (result.rowCount ?? 0) > 0;
   }
 
   // Project Assignments
@@ -91,7 +91,7 @@ export class ProjectsService {
 
   async removeUserFromProject(assignmentId: string): Promise<boolean> {
     const result = await pool.query('DELETE FROM project_assignments WHERE id = $1', [assignmentId]);
-    return result.rowCount > 0;
+    return (result.rowCount ?? 0) > 0;
   }
 
   async getUserProjects(userId: string): Promise<Project[]> {

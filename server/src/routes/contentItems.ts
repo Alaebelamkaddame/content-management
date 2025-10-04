@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { ContentItemsController } from '../controllers/contentItemsController';
 
+//router
 const router = Router();
 const contentItemsController = new ContentItemsController();
 
