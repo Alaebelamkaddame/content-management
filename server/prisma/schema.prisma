@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------
+// USERS TABLE
+// ----------------------------------------------------
+model users {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  username      String    @unique
+  password_hash String
+  role          String
+  full_name     String
+  avatar_url    String?
+  email         String    @unique
+  created_at    DateTime? @default(now())
+  updated_at    DateTime? @default(now())
+
+  project_assignments project_assignments[]
+  content_items       content_items[]       @relation("UserContentItems")
+}
+
+// ----------------------------------------------------
+// PROJECTS TABLE
+// ----------------------------------------------------
+model projects {
+  id          String   @id
+  name        String
+  description String   @default("")
+  archived    Boolean  @default(false)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  // Relations
+  assignments  project_assignments[]
+  content      content_items[]
+  clientTokens client_tokens[]
+}
+
+// ----------------------------------------------------
+// PROJECT ASSIGNMENTS TABLE
+// ----------------------------------------------------
+model project_assignments {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  project_id String
+  user_id    String   @db.Uuid
+  created_at DateTime @default(now())
+
+  // Relations
+  project projects @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  user    users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([project_id, user_id])
+}
+
+// ----------------------------------------------------
+// CONTENT ITEMS TABLE
+// ----------------------------------------------------
+model content_items {
+  id             String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  project_id     String
+  title          String?
+  caption        String?
+  type           String
+  platforms      Json?
+  status         String?
+  assignee_id    String?   @db.Uuid
+  start_date     DateTime
+  end_date       DateTime?
+  assets         Json?
+  notes_internal String?
+  notes_client   String?
+  created_at     DateTime? @default(now())
+  updated_at     DateTime? @default(now())
+
+  // Relations
+  assignee   users?    @relation("UserContentItems", fields: [assignee_id], references: [id])
+  projects   projects? @relation(fields: [projectsId], references: [id])
+  projectsId String?
+}
+
+// ----------------------------------------------------
+// CLIENT TOKENS TABLE
+// ----------------------------------------------------
+model client_tokens {
+  id         String   @id @default(uuid())
+  project_id String
+  token      String   @unique @default(uuid())
+  created_at DateTime @default(now())
+
+  // Relations
+  project projects @relation(fields: [project_id], references: [id], onDelete: Cascade)
+}
