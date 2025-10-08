@@ -75,10 +75,107 @@ apiRouter.post('/users', authenticate, authorize('admin'), async (req, res) => {
     res.status(201).json(userWithoutPassword);
 });
 
+apiRouter.get('/users/initial-project', authenticate, authorize('team_member'), async (req: AuthRequest, res) => {
+    try {
+        const userId = req.user!.id;
+        
+        // Find the first content item assigned to this user
+        const firstContentItem = await prisma.content_items.findFirst({
+            where: { assignee_id: userId },
+            select: { project_id: true } // We only need the ID
+        });
+
+        if (firstContentItem) {
+            // If we found content, return the project ID
+            res.json({ projectId: firstContentItem.project_id });
+        } else {
+            // If the user is assigned to no content, return null
+            res.status(404).json(null);
+        }
+    } catch (error) {
+        console.error("Failed to fetch initial project for team member:", error);
+        res.status(500).json({ message: "An error occurred." });
+    }
+});
+
 // --- Projects Routes ---
-apiRouter.get('/projects', authenticate, async (req, res) => {
-    const projects = await prisma.projects.findMany();
+apiRouter.get('/projects', authenticate, authorize('admin'), async (req, res) => {
+    const projects = await prisma.projects.findMany({ orderBy: { name: 'asc' } });
     res.json(projects);
+});
+
+apiRouter.get('/projects/assigned', authenticate, authorize('admin', 'team_leader'), async (req: AuthRequest, res) => {
+    try {
+        const userId = req.user!.id;
+        const assignments = await prisma.project_assignments.findMany({
+            where: { user_id: userId },
+            include: { project: true },
+        });
+        // Note: It's `a.project` (singular)
+        const assignedProjects = assignments.map(a => a.project);
+        res.json(assignedProjects);
+    } catch (error) {
+        console.error("Failed to fetch assigned projects:", error);
+        res.status(500).json({ message: "An error occurred." });
+    }
+});
+
+apiRouter.get('/projects/:id/assignments', authenticate, authorize('admin'), async (req, res) => {
+    const assignments = await prisma.project_assignments.findMany({
+        where: { project_id: req.params.id },
+        select: { user_id: true }, // We only need the user IDs
+    });
+    res.json(assignments.map(a => a.user_id));
+});
+
+// PUT (update) the assignments for a project
+apiRouter.put('/projects/:id/assignments', authenticate, authorize('admin'), async (req, res) => {
+    const projectId = req.params.id;
+    const { userIds } = req.body; // Expecting an array of user IDs
+
+    if (!Array.isArray(userIds)) {
+        return res.status(400).json({ message: 'userIds must be an array.' });
+    }
+
+    try {
+        // Use a transaction to safely replace the assignments
+        await prisma.$transaction(async (tx) => {
+            // 1. Delete all old assignments for this project
+            await tx.project_assignments.deleteMany({
+                where: { project_id: projectId },
+            });
+
+            // 2. Create the new assignments
+            if (userIds.length > 0) {
+                await tx.project_assignments.createMany({
+                    data: userIds.map((uid: string) => ({
+                        project_id: projectId,
+                        user_id: uid,
+                    })),
+                });
+            }
+        });
+        res.status(200).json({ message: 'Assignments updated successfully.' });
+    } catch (error) {
+        console.error('Failed to update assignments:', error);
+        res.status(500).json({ message: 'An error occurred.' });
+    }
+});
+
+// DELETE a project
+apiRouter.delete('/projects/:id', authenticate, authorize('admin'), async (req, res) => {
+    try {
+        // The transaction ensures that if deleting assignments fails, the project is not deleted.
+        await prisma.$transaction(async (tx) => {
+            await tx.project_assignments.deleteMany({ where: { project_id: req.params.id }});
+            // Note: This will fail if content_items are linked. You need to set up cascading deletes in Prisma.
+            await tx.projects.delete({ where: { id: req.params.id } });
+        });
+        res.status(204).send(); // Success, no content
+    } catch (error) {
+        console.error('Failed to delete project:', error);
+        res.status(500).json({ message: 'Failed to delete project. Make sure all content is removed first.' });
+    }
 });
 
 apiRouter.get('/projects/:id', authenticate, async (req, res) => {
@@ -94,17 +191,84 @@ apiRouter.get('/projects/:projectId/client-token', authenticate, async (req, res
     res.json(token);
 });
 
+apiRouter.post('/projects', authenticate, authorize('admin'), async (req, res) => {
+    try {
+        const { name } = req.body;
+
+        if (!name) {
+            return res.status(400).json({ message: 'Project name is required' });
+        }
+
+        const newProject = await prisma.projects.create({
+            data: {
+                name: name,
+            },
+        });
+
+        res.status(201).json(newProject);
+    } catch (error) {
+        console.error('Failed to create project:', error);
+        res.status(500).json({ message: 'An error occurred while creating the project.' });
+    }
+});
+
 apiRouter.post('/projects/:projectId/client-token', authenticate, async (req, res) => {
     await prisma.client_tokens.deleteMany({ where: { project_id: req.params.projectId } });
     const token = await prisma.client_tokens.create({ data: { project_id: req.params.projectId } });
     res.status(201).json(token);
 });
 
+apiRouter.post('/projects', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
+    try {
+        // Now expecting 'name' and an optional 'userIds' array
+        const { name, userIds } = req.body;
+
+        if (!name) {
+            return res.status(400).json({ message: 'Project name is required' });
+        }
+
+        // Use a transaction to create the project and assignments together
+        const newProject = await prisma.$transaction(async (tx) => {
+            // 1. Create the project
+            const project = await tx.projects.create({
+                data: { name },
+            });
+
+            // 2. If user IDs were provided, create the assignments
+            if (userIds && Array.isArray(userIds) && userIds.length > 0) {
+                await tx.project_assignments.createMany({
+                    data: userIds.map((userId: string) => ({
+                        project_id: project.id,
+                        user_id: userId,
+                    })),
+                });
+            }
+
+            return project;
+        });
+
+        res.status(201).json(newProject);
+    } catch (error) {
+        console.error('Failed to create project with assignments:', error);
+        res.status(500).json({ message: 'An error occurred while creating the project.' });
+    }
+});
+
 // --- Content Routes (Complete Implementation) ---
-apiRouter.get('/content', authenticate, async (req, res) => {
+apiRouter.get('/content', authenticate, async (req: AuthRequest, res) => {
     const { projectId } = req.query;
-    const where: any = {};
-    if (projectId) where.project_id = projectId as string;
+    const { id: userId, role } = req.user!;
+
+    if (!projectId) {
+        return res.status(400).json({ message: "Project ID is required." });
+    }
+
+    const where: any = { project_id: projectId as string };
+
+    if (role === 'team_member') {
+        where.assignee_id = userId;
+    }
+
     const items = await prisma.content_items.findMany({ where });
     res.json(items);
 });
@@ -175,4 +339,4 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer() ; 

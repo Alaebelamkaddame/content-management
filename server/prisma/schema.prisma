@@ -29,7 +29,7 @@ model users {
 // PROJECTS TABLE
 // ----------------------------------------------------
 model projects {
-  id          String   @id
+  id          String    @id @default(uuid())
   name        String
   description String   @default("")
   archived    Boolean  @default(false)
