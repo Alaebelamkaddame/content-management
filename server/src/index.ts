@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { validate as uuidValidate } from 'uuid';
 
 dotenv.config();
 
@@ -15,17 +16,34 @@ const PORT = process.env.PORT || 4000;
 app.use(express.json());
 app.use(cors());
 
-// --- Authentication Middleware ---
-interface AuthRequest extends Request {
-  user?: any;
+// --- Type Definitions for JWT Payload ---
+interface UserPayload {
+    id: string;
+    role: string;
 }
 
+// --- ✅ ADDED: Payload for Client-Specific JWT ---
+interface ClientTokenPayload {
+    projectId: string;
+    type: 'client';
+}
+
+interface AuthRequest extends Request {
+    user?: UserPayload;
+}
+
+// --- Authentication Middleware ---
 const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader) return res.status(401).json({ message: 'Missing token' });
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ message: 'Missing or malformed Bearer token' });
+    }
     const token = authHeader.split(' ')[1];
+    if (!token || token === 'null' || token === 'undefined') {
+        return res.status(401).json({ message: 'Invalid token provided.' });
+    }
     try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET as string);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as UserPayload;
         req.user = decoded;
         next();
     } catch (err) {
@@ -34,12 +52,12 @@ const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
 };
 
 const authorize = (...roles: string[]) => (req: AuthRequest, res: Response, next: NextFunction) => {
-    if (!req.user || !roles.includes(req.user.role)) {
+    const userRole = req.user?.role?.trim() || 'none';
+    if (!req.user || !roles.includes(userRole)) {
         return res.status(403).json({ message: 'Forbidden' });
     }
     next();
 };
-
 
 // --- API Router ---
 const apiRouter = express.Router();
@@ -51,20 +69,21 @@ apiRouter.post('/auth/login', async (req, res) => {
   if (!user || !(await bcrypt.compare(password, user.password_hash))) {
     return res.status(401).json({ message: 'Invalid credentials' });
   }
-  const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET as string, { expiresIn: '8h' });
+  const token = jwt.sign({ id: user.id, role: user.role.trim() }, process.env.JWT_SECRET as string, { expiresIn: '8h' });
   res.json({ token });
 });
 
 // --- Users Routes ---
 apiRouter.get('/users/:id', authenticate, async (req, res) => {
-    const user = await prisma.users.findUnique({ where: { id: req.params.id } });
+    const { id } = req.params;
+    if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid UUID for user ID' });
+    const user = await prisma.users.findUnique({ where: { id } });
     if (!user) return res.status(404).json({ message: 'User not found' });
     res.json(user);
 });
 
 apiRouter.get('/users', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
-    const users = await prisma.users.findMany({ orderBy: { full_name: 'asc' } });
-    res.json(users);
+    res.json(await prisma.users.findMany({ orderBy: { full_name: 'asc' } }));
 });
 
 apiRouter.post('/users', authenticate, authorize('admin'), async (req, res) => {
@@ -75,268 +94,133 @@ apiRouter.post('/users', authenticate, authorize('admin'), async (req, res) => {
     res.status(201).json(userWithoutPassword);
 });
 
-apiRouter.get('/users/initial-project', authenticate, authorize('team_member'), async (req: AuthRequest, res) => {
-    try {
-        const userId = req.user!.id;
-        
-        // Find the first content item assigned to this user
-        const firstContentItem = await prisma.content_items.findFirst({
-            where: { assignee_id: userId },
-            select: { project_id: true } // We only need the ID
-        });
-
-        if (firstContentItem) {
-            // If we found content, return the project ID
-            res.json({ projectId: firstContentItem.project_id });
-        } else {
-            // If the user is assigned to no content, return null
-            res.status(404).json(null);
-        }
-    } catch (error) {
-        console.error("Failed to fetch initial project for team member:", error);
-        res.status(500).json({ message: "An error occurred." });
-    }
-});
-
 // --- Projects Routes ---
-apiRouter.get('/projects', authenticate, authorize('admin'), async (req, res) => {
-    const projects = await prisma.projects.findMany({ orderBy: { name: 'asc' } });
-    res.json(projects);
+apiRouter.get('/projects', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
+    res.json(await prisma.projects.findMany({ orderBy: { name: 'asc' } }));
 });
 
-apiRouter.get('/projects/assigned', authenticate, authorize('admin', 'team_leader'), async (req: AuthRequest, res) => {
-    try {
-        const userId = req.user!.id;
-        const assignments = await prisma.project_assignments.findMany({
-            where: { user_id: userId },
-            include: { project: true },
-        });
-        // Note: It's `a.project` (singular)
-        const assignedProjects = assignments.map(a => a.project);
-        res.json(assignedProjects);
-    } catch (error) {
-        console.error("Failed to fetch assigned projects:", error);
-        res.status(500).json({ message: "An error occurred." });
-    }
-});
-
-apiRouter.get('/projects/:id/assignments', authenticate, authorize('admin'), async (req, res) => {
+apiRouter.get('/projects/assigned', authenticate, authorize('admin', 'team_leader', 'team_member'), async (req: AuthRequest, res) => {
+    if (!req.user) return res.status(401).json({ message: "User not found." });
     const assignments = await prisma.project_assignments.findMany({
-        where: { project_id: req.params.id },
-        select: { user_id: true }, // We only need the user IDs
+        where: { user_id: req.user.id },
+        include: { project: true },
     });
-    res.json(assignments.map(a => a.user_id));
-});
-
-// PUT (update) the assignments for a project
-apiRouter.put('/projects/:id/assignments', authenticate, authorize('admin'), async (req, res) => {
-    const projectId = req.params.id;
-    const { userIds } = req.body; // Expecting an array of user IDs
-
-    if (!Array.isArray(userIds)) {
-        return res.status(400).json({ message: 'userIds must be an array.' });
-    }
-
-    try {
-        // Use a transaction to safely replace the assignments
-        await prisma.$transaction(async (tx) => {
-            // 1. Delete all old assignments for this project
-            await tx.project_assignments.deleteMany({
-                where: { project_id: projectId },
-            });
-
-            // 2. Create the new assignments
-            if (userIds.length > 0) {
-                await tx.project_assignments.createMany({
-                    data: userIds.map((uid: string) => ({
-                        project_id: projectId,
-                        user_id: uid,
-                    })),
-                });
-            }
-        });
-        res.status(200).json({ message: 'Assignments updated successfully.' });
-    } catch (error) {
-        console.error('Failed to update assignments:', error);
-        res.status(500).json({ message: 'An error occurred.' });
-    }
-});
-
-// DELETE a project
-apiRouter.delete('/projects/:id', authenticate, authorize('admin'), async (req, res) => {
-    try {
-        // The transaction ensures that if deleting assignments fails, the project is not deleted.
-        await prisma.$transaction(async (tx) => {
-            await tx.project_assignments.deleteMany({ where: { project_id: req.params.id }});
-            // Note: This will fail if content_items are linked. You need to set up cascading deletes in Prisma.
-            await tx.projects.delete({ where: { id: req.params.id } });
-        });
-        res.status(204).send(); // Success, no content
-    } catch (error) {
-        console.error('Failed to delete project:', error);
-        res.status(500).json({ message: 'Failed to delete project. Make sure all content is removed first.' });
-    }
+    res.json(assignments.map(a => a.project));
 });
 
 apiRouter.get('/projects/:id', authenticate, async (req, res) => {
-    const project = await prisma.projects.findUnique({ where: { id: req.params.id } });
+    const { id } = req.params;
+    if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid project ID' });
+    const project = await prisma.projects.findUnique({ where: { id } });
     if (!project) return res.status(404).json({ message: 'Project not found' });
     res.json(project);
 });
 
-// --- Client Token Routes ---
-apiRouter.get('/projects/:projectId/client-token', authenticate, async (req, res) => {
-    const token = await prisma.client_tokens.findFirst({ where: { project_id: req.params.projectId } });
-    if (!token) return res.status(404).json({ message: 'Token not found' });
-    res.json(token);
-});
+// --- ✅ FIX: Add route to create and get a client token for a project ---
+apiRouter.get('/projects/:id/client-token', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
+    const { id } = req.params;
+    if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid project ID format' });
 
-apiRouter.post('/projects', authenticate, authorize('admin'), async (req, res) => {
     try {
-        const { name } = req.body;
-
-        if (!name) {
-            return res.status(400).json({ message: 'Project name is required' });
+        const project = await prisma.projects.findUnique({ where: { id } });
+        if (!project) {
+            return res.status(404).json({ message: 'Project not found' });
         }
 
-        const newProject = await prisma.projects.create({
-            data: {
-                name: name,
-            },
-        });
+        // Generate a long-lived token specifically for this client project view
+        const clientToken = jwt.sign(
+            { projectId: project.id, type: 'client' },
+            process.env.JWT_SECRET as string,
+            { expiresIn: '30d' } // The client link will be valid for 30 days
+        );
 
-        res.status(201).json(newProject);
+        res.json({ token: clientToken });
+
     } catch (error) {
-        console.error('Failed to create project:', error);
-        res.status(500).json({ message: 'An error occurred while creating the project.' });
+        console.error('Error generating client token:', error);
+        res.status(500).json({ message: 'Could not generate client token.' });
     }
 });
 
-apiRouter.post('/projects/:projectId/client-token', authenticate, async (req, res) => {
-    await prisma.client_tokens.deleteMany({ where: { project_id: req.params.projectId } });
-    const token = await prisma.client_tokens.create({ data: { project_id: req.params.projectId } });
-    res.status(201).json(token);
-});
 
 apiRouter.post('/projects', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
-    try {
-        // Now expecting 'name' and an optional 'userIds' array
-        const { name, userIds } = req.body;
-
-        if (!name) {
-            return res.status(400).json({ message: 'Project name is required' });
-        }
-
-        // Use a transaction to create the project and assignments together
-        const newProject = await prisma.$transaction(async (tx) => {
-            // 1. Create the project
-            const project = await tx.projects.create({
-                data: { name },
+    const { name, userIds } = req.body;
+    if (!name) return res.status(400).json({ message: 'Project name required' });
+    const newProject = await prisma.$transaction(async (tx) => {
+        const project = await tx.projects.create({ data: { name } });
+        if (userIds?.length) {
+            await tx.project_assignments.createMany({
+                data: userIds.map((userId: string) => ({ project_id: project.id, user_id: userId })),
             });
+        }
+        return project;
+    });
+    res.status(201).json(newProject);
+});
 
-            // 2. If user IDs were provided, create the assignments
-            if (userIds && Array.isArray(userIds) && userIds.length > 0) {
-                await tx.project_assignments.createMany({
-                    data: userIds.map((userId: string) => ({
-                        project_id: project.id,
-                        user_id: userId,
-                    })),
-                });
-            }
+apiRouter.delete('/projects/:id', authenticate, authorize('admin'), async (req, res) => {
+    const { id } = req.params;
+    if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid project ID format' });
+    await prisma.$transaction(async (tx) => {
+        await tx.project_assignments.deleteMany({ where: { project_id: id } });
+        await tx.projects.delete({ where: { id } });
+    });
+    res.status(204).send();
+});
 
-            return project;
+// --- Content Routes ---
+apiRouter.get('/content/my-assignments', authenticate, authorize('team_member'), async (req: AuthRequest, res) => {
+    try {
+        if (!req.user) return res.status(401).json({ message: "User not found." });
+        const assignedContent = await prisma.content_items.findMany({
+            where: { assignee_id: req.user.id },
+            orderBy: { start_date: 'asc' }
         });
-
-        res.status(201).json(newProject);
+        res.json(assignedContent);
     } catch (error) {
-        console.error('Failed to create project with assignments:', error);
-        res.status(500).json({ message: 'An error occurred while creating the project.' });
+        res.status(500).json({ message: "Failed to fetch assigned content." });
     }
 });
 
-// --- Content Routes (Complete Implementation) ---
 apiRouter.get('/content', authenticate, async (req: AuthRequest, res) => {
+    if (!req.user) return res.status(401).json({ message: "User not found." });
     const { projectId } = req.query;
-    const { id: userId, role } = req.user!;
+    if (!projectId || typeof projectId !== 'string') return res.status(400).json({ message: "Project ID is required." });
 
-    if (!projectId) {
-        return res.status(400).json({ message: "Project ID is required." });
-    }
-
-    const where: any = { project_id: projectId as string };
-
-    if (role === 'team_member') {
-        where.assignee_id = userId;
-    }
-
-    const items = await prisma.content_items.findMany({ where });
-    res.json(items);
+    const where: any = { project_id: projectId };
+    res.json(await prisma.content_items.findMany({ where }));
 });
 
 apiRouter.post('/content', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
     const { start_date, end_date, assignee_id, ...restOfData } = req.body;
-    if (!restOfData.project_id) {
-        return res.status(400).json({ message: 'Project ID is required.' });
-    }
-    const dataForPrisma = {
+    if (!restOfData.project_id) return res.status(400).json({ message: 'Project ID is required.' });
+    const data = {
         ...restOfData,
-        start_date: start_date ? new Date(start_date).toISOString() : undefined,
-        end_date: end_date ? new Date(end_date).toISOString() : null,
+        start_date: start_date ? new Date(start_date) : undefined,
+        end_date: end_date ? new Date(end_date) : null,
         assignee_id: assignee_id || null,
     };
-    try {
-        const newItem = await prisma.content_items.create({
-            // @ts-ignore
-            data: dataForPrisma,
-        });
-        res.status(201).json(newItem);
-    } catch (error) {
-        console.error("Failed to create content item:", error);
-        res.status(500).json({ message: "An error occurred while creating the content item." });
-    }
+    res.status(201).json(await prisma.content_items.create({ data }));
 });
 
 apiRouter.put('/content/:id', authenticate, async (req, res) => {
+    const { id } = req.params;
+    if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid content ID' });
     const { start_date, end_date, assignee_id, ...updates } = req.body;
-    const dataForPrisma: any = { ...updates };
-    if (start_date !== undefined) {
-      dataForPrisma.start_date = start_date ? new Date(start_date).toISOString() : null;
-    }
-    if (end_date !== undefined) {
-      dataForPrisma.end_date = end_date ? new Date(end_date).toISOString() : null;
-    }
-    if (assignee_id !== undefined) {
-      dataForPrisma.assignee_id = assignee_id || null;
-    }
-    try {
-        const updatedItem = await prisma.content_items.update({
-            where: { id: req.params.id },
-            data: dataForPrisma,
-        });
-        res.json(updatedItem);
-    } catch (error) {
-        console.error(`Failed to update content item ${req.params.id}:`, error);
-        res.status(404).json({ message: 'Content item not found or update failed.' });
-    }
+    const data: any = { ...updates };
+    if (start_date !== undefined) data.start_date = start_date ? new Date(start_date) : null;
+    if (end_date !== undefined) data.end_date = end_date ? new Date(end_date) : null;
+    if (assignee_id !== undefined) data.assignee_id = assignee_id || null;
+    res.json(await prisma.content_items.update({ where: { id }, data }));
 });
 
 apiRouter.delete('/content/:id', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
-    try {
-        await prisma.content_items.delete({ where: { id: req.params.id } });
-        res.status(204).send();
-    } catch (error) {
-        res.status(404).json({ message: 'Content item not found.' });
-    }
+    const { id } = req.params;
+    if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid content ID' });
+    await prisma.content_items.delete({ where: { id } });
+    res.status(204).send();
 });
 
 // --- Mount Router & Start Server ---
 app.use('/api', apiRouter);
-
-async function startServer() {
- 
-  app.listen(PORT, () => {
-    console.log(`🚀 API server is running on http://localhost:${PORT}`);
-  });
-}
-
-startServer() ; 
+app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
