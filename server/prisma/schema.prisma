@@ -73,6 +73,7 @@ model content_items {
   start_date     DateTime
   end_date       DateTime?
   assets         Json?
+  asset_urls     String[] 
   notes_internal String?
   notes_client   String?
   created_at     DateTime? @default(now())

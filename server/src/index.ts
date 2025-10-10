@@ -6,6 +6,11 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { validate as uuidValidate } from 'uuid';
 
+// --- IMPORT new modules for file handling ---
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+
 dotenv.config();
 
 const app = express();
@@ -16,13 +21,20 @@ const PORT = process.env.PORT || 4000;
 app.use(express.json());
 app.use(cors());
 
+// --- serv static files/images ---
+const uploadsDir = path.join(__dirname, '../uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+app.use('/uploads', express.static(uploadsDir));
+
+
 // --- Type Definitions for JWT Payload ---
 interface UserPayload {
     id: string;
     role: string;
 }
 
-// --- ✅ ADDED: Payload for Client-Specific JWT ---
 interface ClientTokenPayload {
     projectId: string;
     type: 'client';
@@ -62,6 +74,21 @@ const authorize = (...roles: string[]) => (req: AuthRequest, res: Response, next
 // --- API Router ---
 const apiRouter = express.Router();
 
+// --- multer for File Uploads ---
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir); // Save files to the 'uploads' directory
+  },
+  filename: (req, file, cb) => {
+    // Create a unique filename to prevent overwrites
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+  }
+});
+
+const upload = multer({ storage: storage });
+
+
 // --- Auth Routes ---
 apiRouter.post('/auth/login', async (req, res) => {
   const { username, password } = req.body;
@@ -72,6 +99,23 @@ apiRouter.post('/auth/login', async (req, res) => {
   const token = jwt.sign({ id: user.id, role: user.role.trim() }, process.env.JWT_SECRET as string, { expiresIn: '8h' });
   res.json({ token });
 });
+
+// --- new File Upload Route ---
+apiRouter.post('/upload', authenticate, upload.array('assets', 10), (req, res) => {
+  if (!req.files || (req.files as Express.Multer.File[]).length === 0) {
+    return res.status(400).json({ message: 'No files were uploaded.' });
+  }
+
+  const files = req.files as Express.Multer.File[];
+  
+  const fileUrls = files.map(file => {
+    const serverBaseUrl = `${req.protocol}://${req.get('host')}`;
+    return `${serverBaseUrl}/uploads/${file.filename}`;
+  });
+
+  res.status(201).json({ urls: fileUrls });
+});
+
 
 // --- Users Routes ---
 apiRouter.get('/users/:id', authenticate, async (req, res) => {
@@ -116,7 +160,6 @@ apiRouter.get('/projects/:id', authenticate, async (req, res) => {
     res.json(project);
 });
 
-// --- ✅ FIX: Add route to create and get a client token for a project ---
 apiRouter.get('/projects/:id/client-token', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
     const { id } = req.params;
     if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid project ID format' });
@@ -126,22 +169,17 @@ apiRouter.get('/projects/:id/client-token', authenticate, authorize('admin', 'te
         if (!project) {
             return res.status(404).json({ message: 'Project not found' });
         }
-
-        // Generate a long-lived token specifically for this client project view
         const clientToken = jwt.sign(
             { projectId: project.id, type: 'client' },
             process.env.JWT_SECRET as string,
-            { expiresIn: '30d' } // The client link will be valid for 30 days
+            { expiresIn: '30d' }
         );
-
         res.json({ token: clientToken });
-
     } catch (error) {
         console.error('Error generating client token:', error);
         res.status(500).json({ message: 'Could not generate client token.' });
     }
 });
-
 
 apiRouter.post('/projects', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
     const { name, userIds } = req.body;
@@ -192,13 +230,15 @@ apiRouter.get('/content', authenticate, async (req: AuthRequest, res) => {
 });
 
 apiRouter.post('/content', authenticate, authorize('admin', 'team_leader'), async (req, res) => {
-    const { start_date, end_date, assignee_id, ...restOfData } = req.body;
+    const { start_date, end_date, assignee_id, asset_urls, ...restOfData } = req.body;
     if (!restOfData.project_id) return res.status(400).json({ message: 'Project ID is required.' });
+    
     const data = {
         ...restOfData,
         start_date: start_date ? new Date(start_date) : undefined,
         end_date: end_date ? new Date(end_date) : null,
         assignee_id: assignee_id || null,
+        asset_urls: asset_urls || [],
     };
     res.status(201).json(await prisma.content_items.create({ data }));
 });
@@ -206,11 +246,15 @@ apiRouter.post('/content', authenticate, authorize('admin', 'team_leader'), asyn
 apiRouter.put('/content/:id', authenticate, async (req, res) => {
     const { id } = req.params;
     if (!uuidValidate(id)) return res.status(400).json({ error: 'Invalid content ID' });
-    const { start_date, end_date, assignee_id, ...updates } = req.body;
+    
+    const { start_date, end_date, assignee_id, asset_urls, ...updates } = req.body;
+    
     const data: any = { ...updates };
     if (start_date !== undefined) data.start_date = start_date ? new Date(start_date) : null;
     if (end_date !== undefined) data.end_date = end_date ? new Date(end_date) : null;
     if (assignee_id !== undefined) data.assignee_id = assignee_id || null;
+    if (asset_urls !== undefined) data.asset_urls = asset_urls;
+    
     res.json(await prisma.content_items.update({ where: { id }, data }));
 });
 
